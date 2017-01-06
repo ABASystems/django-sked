@@ -27,6 +27,16 @@ class Event(models.Model):
     def __str__(self):
         return '{}'.format(self.occurred)
 
+    def amend(self, **kwargs):
+        if self.amended is not None:
+            raise ValueError('cannot amend an event with an amendment')
+        pk = self.pk
+        self.pk = None
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        self.amended_id = pk
+        self.save()
+
 
 class RepeatingEvent(models.Model):
     """ An event that occurs multiple times with regular intervals.

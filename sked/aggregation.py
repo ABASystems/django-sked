@@ -43,79 +43,85 @@ def make_repeating_event_iterator(rev, future):
         yield (date, rev)
 
 
-def overlapping_repeating_events(RepeatingEvent, dtrange, ordered=False):
+def canonicalize_events(events):
+    events = events if events is not None else []
+    events = [(e.source, e.occurred)
+              for e in events
+              if events.parent is None and events.source]
+    return set(events)
+
+
+def overlapping_repeating_events(RepeatingEvent, dtrange):
     """ Yield all repeating events that overlap the provided time range.
     """
     future = make_future_dtrange(dtrange)
     if future[1] is None:
         raise UnboundedOverlapError
-    if ordered:
-        all_revs = []
-        for rev in RepeatingEvent.objects.filter(range__overlap=future):
-            all_revs.append(iter(make_repeating_event_iterator(rev, future)))
-        for date, rev in heapq.merge(*all_revs, key=lambda x: x[0]):
-            yield rev.instantiate(date)
-    else:
-        for rev in RepeatingEvent.objects.filter(range__overlap=future):
-            # cur_range = (
-            #     max(future[0], rev.range.lower),
-            #     min(future[1], rev.range.upper) if rev.range.upper is not None else future[1]
-            # )
-            # rr = rrulestr(rev.repetition, dtstart=cur_range[0])
-            # for dt in rr.xafter(datetime.combine(cur_range[0], time()), inc=True):
-            for date, _rev in make_repeating_event_iterator(rev, future):
-                # date = dt.date()
-                # if date >= cur_range[1]:
-                #     break
-                yield _rev.instantiate(date)
+    all_revs = []
+    for rev in RepeatingEvent.objects.filter(range__overlap=future):  # TODO: chunking
+        all_revs.append(iter(make_repeating_event_iterator(rev, future)))
+    if len(all_revs) > 1000:
+        raise AggregationError('probably too many repeating-event objects')
+    for date, rev in heapq.merge(*all_revs, key=lambda x: x[0]):
+        yield rev.instantiate(date)
 
 
-def overlapping_events(Event, dtrange, ordered=False):
-    """ Yield all non-repeating events that overlapt the provided time range.
+def overlapping_events(Event, dtrange):
+    """ Yield all non-repeating events that overlap the provided time range.
+
+    Note that this will return events that are amendments. This is because I
+    want the sources to be available for the `overlap` function in order to
+    remove future duplicates. I will filter out non-amendments in `overlap`.
     """
-    query = {'amendments__isnull': True}
+    query = {}
     if dtrange[0] is not None:
         query['occurred__gte'] = dtrange[0]
     if dtrange[1] is not None:
         query['occurred__lt'] = dtrange[1]
-    ev_qs = Event.objects.filter(**query)
-    if ordered:
-        ev_qs = ev_qs.order_by('created')
+    ev_qs = Event.objects.filter(**query).order_by('occurred')  # TODO: chunking
     for ev in ev_qs:
         yield ev
 
 
-def overlap(Event, RepeatingEvent, dtrange, ordered=False):
+def overlap(Event, RepeatingEvent, dtrange):
     """ Find all overlapping events.
     """
     all_evs = [
-        iter(overlapping_events(Event, dtrange, ordered=ordered)),
-        iter(overlapping_repeating_events(RepeatingEvent, dtrange, ordered=ordered))
+        iter(overlapping_events(Event, dtrange)),
+        iter(overlapping_repeating_events(RepeatingEvent, dtrange))
     ]
-    if ordered:
-        for ev in heapq.merge(*all_evs, key=lambda x: x.occurred):
-            yield ev
-    else:
-        all_evs = itertools.chain(*all_evs)
-        for ev in all_evs:
-            yield ev
+    lce_date = None  # last concrete event date
+    lce_sources = set()  # last concrete event sources
+    for ev in heapq.merge(*all_evs, key=lambda x: x.occurred):
 
+        # This part allows us to prevent duplicate generation of future events
+        # when they have been pregenerated. It hinges on `heapq.merge` respecting
+        # iterator order; I pass in the concrete event iterator first.
+        if ev.id is not None:
+            if lce_date != ev.occurred:
+                lce_date = ev.occurred
+                lce_sources = set()
+            if ev.source:
+                lce_sources.add(ev.source.id)
+        elif lce_date is not None and lce_date == ev.occurred and ev.source.id in lce_sources:
+            continue
 
-def validate_operation(op, ordered=False):
-    if getattr(op, 'ordered', False) and not op:
-        raise AggregationError('operation requires ordered aggregation')
+        # Don't send through concrete events that have amendments.
+        if ev.amendments.exists():  # TODO: perhaps use a boolean "is_amended" for performance?
+            continue
+
+        yield ev
 
 
 def aggregate(Event, RepeatingEvent, dtrange, op, initial=None,
-              ordered=False, exclude_tagged=True):
+              exclude_tagged=True):
     """ Perform an aggregate over overlapping events.
 
     By default any event with tags is excluded from the aggregation. To include
     tagged events set `exclude_tagged` to True.
     """
-    validate_operation(op, ordered=ordered)
     val = initial
-    for ev in overlap(Event, RepeatingEvent, dtrange, ordered=ordered):
+    for ev in overlap(Event, RepeatingEvent, dtrange):
         if exclude_tagged and len(ev.tags.keys()):
             continue
         val = op(val, op.coerce(ev))
